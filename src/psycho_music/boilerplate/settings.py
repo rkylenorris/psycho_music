@@ -39,13 +39,17 @@ class LoggingSettings(BaseModel):
 
 class AppSettings(BaseSettings):
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", env_nested_delimiter="__", case_sensitive=False)
+    model_config = SettingsConfigDict(env_file=".env",
+                                      env_file_encoding="utf-8",
+                                      env_nested_delimiter="__",
+                                      case_sensitive=False)
 
     app_name: str
     pickup_dir: str
     data_dir: str
     consumed_files_hashes_file: str
     logging: LoggingSettings
+    excluded_daylio_data: list[str]
 
 
 @lru_cache

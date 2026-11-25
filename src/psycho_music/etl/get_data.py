@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from datetime import datetime
 
-from ..boillerplate import get_app_settings, get_logger
+from ..boilerplate import get_app_settings, get_logger
 
 
 logger = get_logger()
@@ -163,17 +163,19 @@ class DaylioBackupData:
         daylio_data = json.loads(contents) if contents else []
 
         if json_path.exists():
-            logger.info(f"JSON file '{json_path}' already exists. Deleting it.")
+            logger.debug(f"JSON file '{json_path}' already exists. Deleting it.")
             json_path.unlink()
 
         with json_path.open('w') as jp:
             json.dump(daylio_data, jp, indent=4)
 
         logger.info(f"Copying JSON file '{json_path}' to archive '{json_archive_path}'...")
+        if json_archive_path.exists():
+            json_archive_path.unlink()
         json_path.copy(json_archive_path)
 
 
-    def get_daylio_data(self) -> Path:
+    def extract_data(self) -> Path:
         """
         Main method to get Daylio data. It checks for new backups, extracts them, and decodes to JSON.
         Returns the path to the JSON file.
