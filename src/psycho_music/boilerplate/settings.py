@@ -50,6 +50,7 @@ class AppSettings(BaseSettings):
     consumed_files_hashes_file: str
     logging: LoggingSettings
     excluded_daylio_data: list[str]
+    db_path: str
 
 
 @lru_cache
