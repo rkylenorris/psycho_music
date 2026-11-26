@@ -5,7 +5,6 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from .db_cmds import create_connection
-
 from ..boilerplate import get_logger, get_app_settings
 
 settings = get_app_settings()
