@@ -1,19 +1,18 @@
 import os
+import re
 import json
 import shutil
 import base64
 import hashlib
 import zipfile as zf
 
-from datetime import datetime
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
 
-from ..boilerplate import get_app_settings, get_logger
-
+from ..boilerplate import AppSettings, get_logger
 
 logger = get_logger()
-app_settings = get_app_settings()
 
 
 class DaylioBackupDirectoryNotFoundError(Exception):
@@ -26,81 +25,88 @@ class DaylioBackupNotFoundError(Exception):
     pass
 
 
+class DaylioBackupMissingDate(Exception):
+    pass
+
+
+@dataclass
+class DaylioBackupHash:
+    date: str
+    hash: str
+
+
 class DaylioBackupData:
     """
     Class for finding, decoding, and checking if daylio data is new.
     """
 
-    def __init__(self):
+    def __init__(self, app_settings: AppSettings):
         self.pickup_dir: Path = Path(app_settings.pickup_dir)
         self.data_dir: Path = Path(app_settings.data_dir)
         self.archive_dir: Path = self.data_dir / 'archive'
         self.hashes_file_path: Path = Path(app_settings.consumed_files_hashes_file)
         self.extracted_path: Path = self.data_dir / 'backup.daylio'
         self.json_path = self.data_dir / 'daylio.json'
-        self.consumed_hashes: set[str] = self._load_consumed_hashes()
+        self.consumed_hashes: list[DaylioBackupHash] = self._load_consumed_hashes()
+        self.backup_path: Path
+        self.backup_date: datetime
+        self.backup_hash: DaylioBackupHash
+        self.data_dir_backup_copy: Path
 
-        if not self.pickup_dir.exists():
-            logger.error(f"Pickup directory '{self.pickup_dir}' does not exist.")
-            raise DaylioBackupDirectoryNotFoundError(
-                f"Pickup directory '{self.pickup_dir}' does not exist."
-            )
 
-        if not self.data_dir.exists():
-            logger.info(f"Data directory '{self.data_dir}' does not exist. Creating it.")
-            self.data_dir.mkdir(parents=True, exist_ok=True)
-
-        if not self.archive_dir.exists():
-            logger.info(f"Archive directory '{self.archive_dir}' does not exist. Creating it.")
-            self.archive_dir.mkdir(parents=True, exist_ok=True)
-
-        self.backup_path: Path = self._find_backup()
-        self.backup_date: datetime = self._get_backup_date()
-        
-
-    def _load_consumed_hashes(self) -> set[str]:
+    def _load_consumed_hashes(self) -> list[DaylioBackupHash]:
         """Load the hashes of consumed files from the hashes file."""
         if not self.hashes_file_path.exists():
             logger.info(f"Hashes file '{self.hashes_file_path}' does not exist. Creating it.")
-            self.hashes_file_path.touch()
-            return set()
+            with self.hashes_file_path.open('w') as h:
+                 h.write('[]')
+            return []
 
         with self.hashes_file_path.open('r') as f:
-            return set(line.strip() for line in f if line.strip())
+            hashes = json.load(f)
+            return [DaylioBackupHash(**h) for h in hashes]
 
 
-    def _get_file_hash(self, file_path: Path) -> str:
+    def get_file_hash(self):
             """Calculate the SHA256 hash of a file."""
     
             sha256_hash = hashlib.sha256()
-            with file_path.open("rb") as f:
+            with self.extracted_path.open("rb") as f:
                 for byte_block in iter(lambda: f.read(4096), b""):
                     sha256_hash.update(byte_block)
-            return sha256_hash.hexdigest()
+            self.backup_hash = DaylioBackupHash(self.backup_date.strftime('%Y.%m.%d'), sha256_hash.hexdigest())
     
     
-    def _add_hash_to_consumed(self, file_hash: str) -> None:
+    def add_hash_to_consumed(self) -> None:
             """Add a file hash to the consumed hashes set and update the hashes file."""
-            self.consumed_hashes.add(file_hash)
-            with self.hashes_file_path.open('a') as f:
-                f.write(file_hash + '\n')
+            self.consumed_hashes.append(self.backup_hash)
+            with self.hashes_file_path.open('w') as f:
+                json.dump([d.__dict__ for d in self.consumed_hashes], f)
 
+    
+    def find_backup(self):
 
-    def _find_backup(self) -> Path:
+        if not self.pickup_dir.exists():
+                    logger.error(f"Pickup directory '{self.pickup_dir}' does not exist.")
+                    raise DaylioBackupDirectoryNotFoundError(
+                        f"Pickup directory '{self.pickup_dir}' does not exist."
+                    )
 
         todays_file_name = datetime.today().strftime('backup_%Y_%m_%d.daylio')
         todays_file_path = self.pickup_dir / todays_file_name
 
         if todays_file_path.exists():
             logger.info(f"Found Daylio backup file: {todays_file_path}")
-            return todays_file_path
+            self.backup_path = todays_file_path
+            self._get_backup_date()
         else:
             logger.info(f"No backup file for today found. Searching for the most recent backup in '{self.pickup_dir}'...")
             files = [f for f in self.pickup_dir.glob("backup*.daylio") if f.is_file()]
             daylio_file = max(files, key=os.path.getctime, default=None)
             if daylio_file:
                 logger.info(f"Found Daylio backup file: {daylio_file}")
-                return daylio_file
+                self.backup_path = daylio_file
+                self._get_backup_date()
             else:
                 logger.error(f"No Daylio backup files found in '{self.pickup_dir}'.")
                 raise DaylioBackupNotFoundError(
@@ -108,52 +114,59 @@ class DaylioBackupData:
                 )
 
 
-    def _get_backup_date(self) -> datetime:
+    def _get_backup_date(self):
         """Extract the date from the backup file name."""
-        try:
-            date_str = self.backup_path.stem.split('_')[1:]  # Skip 'backup'
-            return datetime.strptime('_'.join(date_str), '%Y_%m_%d')
-        except IndexError:
-            logger.error(f"Unexpected backup file name format: {self.backup_path.name}")
-            raise ValueError(f"Unexpected backup file name format: {self.backup_path.name}")
+        date_search = re.search(r"(\d{4}_\d{2}_\d{2})", self.backup_path.name)
+        if date_search:
+            date_str = date_search.group()
+            self.backup_date = datetime.strptime(date_str, '%Y_%m_%d')
+        else:
+            raise DaylioBackupMissingDate(f"Backup '{self.backup_path}' missing expected date string in file name.")
 
 
-    def _extract_backup(self) -> None:
+    def copy_backup(self):
+        logger.info("Copying backup to local data directory...")
+        if not self.data_dir.exists():
+                    logger.debug(f"Data directory '{self.data_dir}' does not exist. Creating it.")
+                    self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir_backup_copy = self.data_dir / self.backup_path.name
+        if self.data_dir_backup_copy.exists():
+            self.data_dir_backup_copy.unlink()
+        shutil.copy2(self.backup_path, self.data_dir_backup_copy)
+        logger.info("Copy completed.")
+
+
+    def extract_backup(self) -> None:
         """extract daylio data from zip archive"""
 
-        logger.info(f"Extracting Daylio backup from '{self.backup_path}' to '{self.data_dir}'...")
-
-        copy_target = self.data_dir / self.backup_path.name
-        self.backup_path.copy(copy_target)
+        logger.info(f"Extracting Daylio backup from '{self.data_dir_backup_copy}'..")
 
         if self.extracted_path.exists():
-            logger.info(f"Extracted backup file already exists at '{self.extracted_path}'. Deleting it.")
+            logger.debug(f"Extracted backup file already exists at '{self.extracted_path}'. Deleting it.")
             self.extracted_path.unlink()
 
-        with zf.ZipFile(copy_target, 'r') as zr:
+        with zf.ZipFile(self.data_dir_backup_copy, 'r') as zr:
             zr.extractall(self.data_dir)
             assets_dir = self.data_dir / 'assets'
             if assets_dir.exists():
                 shutil.rmtree(assets_dir)
 
-        copy_target.unlink()
+        logger.info(f'{self.data_dir_backup_copy.name} extraction complete.')
 
 
-    def _is_new_backup(self) -> bool:
+    def is_new_backup(self) -> bool:
         """Check if the backup file is new (not consumed)."""
         logger.debug(f"Checking if backup file '{self.backup_path}' is new...")
 
-        backup_hash = self._get_file_hash(self.backup_path)
-        if backup_hash not in self.consumed_hashes:
-            logger.info(f"Backup file '{self.backup_path}' is new. Adding its hash to consumed hashes.")
-            self._add_hash_to_consumed(backup_hash)
+        if self.backup_hash not in self.consumed_hashes:
+            logger.info(f"Backup file '{self.backup_path}' is new.")
             return True
         else:
-            logger.info(f"Backup file '{self.backup_path}' has already been consumed.")
+            logger.info(f"Backup file '{self.backup_path}' has already been consumed")
             return False
 
 
-    def _decode_backup_to_json(self) -> None:
+    def decode_backup_to_json(self) -> None:
         logger.info(f"Decoding backup file '{self.backup_path}' to JSON...")
         json_path = self.json_path
         json_archive_path = self.archive_dir / f"daylio_{self.backup_date.strftime('%Y_%m_%d')}.json"
@@ -170,21 +183,23 @@ class DaylioBackupData:
             json.dump(daylio_data, jp, indent=4)
 
         logger.info(f"Copying JSON file '{json_path}' to archive '{json_archive_path}'...")
+
+        if not self.archive_dir.exists():
+                    logger.debug(f"Archive directory '{self.archive_dir}' does not exist. Creating it.")
+                    self.archive_dir.mkdir(parents=True, exist_ok=True)
+
         if json_archive_path.exists():
             json_archive_path.unlink()
-        json_path.copy(json_archive_path)
 
+        shutil.copy2(json_path, json_archive_path)
 
-    def extract_data(self) -> Path:
-        """
-        Main method to get Daylio data. It checks for new backups, extracts them, and decodes to JSON.
-        Returns the path to the JSON file.
-        """
-        if self._is_new_backup():
-            self._extract_backup()
-            self._decode_backup_to_json()
-            logger.info(f"Daylio data has been updated and is available at '{self.json_path}'.")
-        else:
-            logger.info(f"No new Daylio backup found. Using existing JSON file at '{self.json_path}'.")
-
+    def extract(self) -> Path:
+        self.find_backup()
+        self.copy_backup()
+        self.extract_backup()
+        self.get_file_hash()
+        if self.is_new_backup():
+            self.decode_backup_to_json()
+            self.add_hash_to_consumed()
         return self.json_path
+            

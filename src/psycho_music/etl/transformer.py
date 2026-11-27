@@ -1,20 +1,21 @@
 import json
 import pandas as pd
+import sqlite3 as sql
 
 from pathlib import Path
 from dataclasses import dataclass
 
-from .db_cmds import create_connection
-from ..boilerplate import get_logger, get_app_settings
+from .db_cmds import get_connection
+from ..boilerplate import get_logger, AppSettings
 
-settings = get_app_settings()
+
 logger = get_logger()
 
 EXCLUDED_DAYLIO_DATA=["tag_colors", "milestones", "writingTemplates", "achievements", "goalSuccessWeeks", "reminders", "prefs", "assets"]
 
 
 @dataclass
-class DaylioTable():
+class DaylioTable:
 
     name: str
     data: pd.DataFrame
@@ -27,20 +28,19 @@ class DaylioTable():
             except Exception as e:
                 logger.warning(f"Failed to convert column '{col}' to datetime: {e}")
 
-    def to_sql(self, engine=create_connection(settings.db_path)):
-        if engine:
-            self.data.to_sql(self.name, con=engine, if_exists='replace', index=False)
-            engine.commit()
-            engine.close()
+    def to_sql(self, engine: sql.Connection):
+        self.data.to_sql(self.name, con=engine, if_exists='replace', index=False)
+
 
 
 
 class DaylioDataTransformer:
 
-    def __init__(self):
-        self.json_path = Path(settings.data_dir) / 'daylio.json'
+    def __init__(self, settings: AppSettings):
+        self.settings = settings
+        self.json_path = Path(self.settings.data_dir) / 'daylio.json'
         self.tables: list[DaylioTable] = []
-        self.mood_groups_path = Path(__file__).parent / "daylio_tables.json"
+        self.mood_groups_path = Path(__file__).parent / "mood_groups.json"
 
     def transform(self):
         logger.info("Starting transformation of Daylio data...")
@@ -57,8 +57,9 @@ class DaylioDataTransformer:
 
     def load_to_db(self):
         logger.info("Loading transformed data into the database...")
-        for table in self.tables:
-            table.to_sql()
+        with get_connection(self.settings.db_path) as conn:
+            for table in self.tables:
+                table.to_sql(conn)
         logger.info("Data loading complete.")
 
     def _load_daylio_data(self):
@@ -95,22 +96,40 @@ class DaylioDataTransformer:
         for table in self.tables:
             if table.name == "dayEntries":
                 logger.info("Processing dayEntries table to create dayEntryTags and dayEntryScales tables...")
-                tags_df = table.data[['id', 'tags']].explode('tags')
-                tags_df = tags_df.rename(columns={'id': 'entry_id', 'tags': 'tag'})
-                tags_df['tag'] = tags_df['tag'].fillna(None)
+                tags_df = self._explode_table_column(table, ['id', 'tags'], 'tags', {'id': 'entry_id', 'tags': 'tag'})
                 self.tables.append(DaylioTable(name="dayEntryTags", data=tags_df))
                 table.data = table.data.drop(columns=['tags'])
 
-                entry_scales_df = pd.json_normalize(table.data.to_records(index=False), "id", [['scaleValues', 'id_scale'], ['scaleValues', 'number_value']])
-                entry_scales_df = entry_scales_df.rename(columns={'id': 'entry_id', 'scaleValues.id_scale': 'scale_id', 'scaleValues.number_value': 'scale_value'})
-                self.tables.append(DaylioTable(name="dayEntryScales", data=entry_scales_df))
+                self._explode_entry_scales(table)
                 table.data = table.data.drop(columns=['scaleValues'])
                 break
 
-    def _normalize_scales(self):
-        columns = ['id', 'name', 'created_at', 'number_scale']
+    def _explode_table_column(self, table: DaylioTable, select_columns: list[str], column_explode: str, columns_rename: dict[str, str] | None = None):
+        exploded = table.data[select_columns].dropna().explode(column_explode).dropna()
+        if columns_rename:
+            return exploded.rename(columns=columns_rename)
+        else:
+            return exploded
+
+    def _explode_entry_scales(self, table: DaylioTable):
+
+        scales_exploded = self._explode_table_column(table, ['id', 'scaleValues'], 'scaleValues')
+
+        scales_unnested = pd.json_normalize(scales_exploded['scaleValues']).reset_index(drop=True)
+
+        entry_scales_df = pd.concat(
+            [scales_exploded[['id']].reset_index(drop=True), scales_unnested],
+            axis=1,
+        ).rename(columns={'id': 'entry_id', 'id_scale': 'scale_id', 'number_value': 'scale_value'})
+
+        self.tables.append(DaylioTable('dayEntryScales', entry_scales_df))
+
+    def _normalize_scales(self):        
         for table in self.tables:
             if table.name == "scales":
                 logger.info("Normalizing scales table...")
-                table.data = pd.json_normalize(table.data[columns].to_records(index=False))
+
+                unpacked = pd.json_normalize(table.data['number_scale']).reset_index(drop=True)
+                table.data = pd.concat([table.data[['id', 'name', 'created_at']].reset_index(drop=True), unpacked], axis=1)
+                
                 break
