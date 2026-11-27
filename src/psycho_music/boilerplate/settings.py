@@ -1,6 +1,5 @@
 import sys
 
-from enum import Enum
 from uuid import uuid4
 from typing import TextIO
 from pydantic import BaseModel, ConfigDict
@@ -10,7 +9,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 def _generate_run_guid() -> str:
     return str(uuid4())
-
 
 
 class LogFileSettings(BaseModel):
